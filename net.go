@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"github.com/armon/go-metrics"
 	"github.com/ugorji/go/codec"
 	"io"
 	"net"
@@ -60,6 +61,11 @@ const (
 // ping request sent directly to node
 type ping struct {
 	SeqNo uint32
+
+	// Node is sent so the target can verify they are
+	// the intended recipient. This is to protect again an agent
+	// restart with a new name.
+	Node string
 }
 
 // indirect ping sent to an indirect ndoe
@@ -67,6 +73,7 @@ type indirectPingReq struct {
 	SeqNo  uint32
 	Target []byte
 	Port   uint16
+	Node   string
 }
 
 // ack response is sent for a ping
@@ -170,6 +177,7 @@ func (m *Memberlist) tcpListen() {
 func (m *Memberlist) handleConn(conn *net.TCPConn) {
 	m.logger.Printf("[INFO] memberlist: Responding to push/pull sync with: %s", conn.RemoteAddr())
 	defer conn.Close()
+	metrics.IncrCounter([]string{"memberlist", "tcp", "accept"}, 1)
 
 	join, remoteNodes, userState, err := m.readRemoteState(conn)
 	if err != nil {
@@ -235,6 +243,7 @@ func (m *Memberlist) udpListen() {
 		lastPacket = time.Now()
 
 		// Ingest this packet
+		metrics.IncrCounter([]string{"memberlist", "udp", "received"}, float32(n))
 		m.ingestPacket(buf[:n], addr)
 	}
 }
@@ -312,6 +321,11 @@ func (m *Memberlist) handlePing(buf []byte, from net.Addr) {
 		m.logger.Printf("[ERR] memberlist: Failed to decode ping request: %s", err)
 		return
 	}
+	// If node is provided, verify that it is for us
+	if p.Node != "" && p.Node != m.config.Name {
+		m.logger.Printf("[WARN] memberlist: Got ping for unexpected node '%s'", p.Node)
+		return
+	}
 	ack := ackResp{p.SeqNo}
 	if err := m.encodeAndSendMsg(from, ackRespMsg, &ack); err != nil {
 		m.logger.Printf("[ERR] memberlist: Failed to send ack: %s", err)
@@ -333,7 +347,7 @@ func (m *Memberlist) handleIndirectPing(buf []byte, from net.Addr) {
 
 	// Send a ping to the correct host
 	localSeqNo := m.nextSeqNo()
-	ping := ping{SeqNo: localSeqNo}
+	ping := ping{SeqNo: localSeqNo, Node: ind.Node}
 	destAddr := &net.UDPAddr{IP: ind.Target, Port: int(ind.Port)}
 
 	// Setup a response handler to relay the ack
@@ -481,6 +495,7 @@ func (m *Memberlist) rawSendMsg(to net.Addr, msg []byte) error {
 		msg = buf.Bytes()
 	}
 
+	metrics.IncrCounter([]string{"memberlist", "udp", "sent"}, float32(len(msg)))
 	_, err := m.udpListener.WriteTo(msg, to)
 	return err
 }
@@ -496,6 +511,7 @@ func (m *Memberlist) sendAndReceiveState(addr []byte, port uint16, join bool) ([
 	}
 	defer conn.Close()
 	m.logger.Printf("[INFO] memberlist: Initiating push/pull sync with: %s", conn.RemoteAddr())
+	metrics.IncrCounter([]string{"memberlist", "tcp", "connect"}, 1)
 
 	// Send our state
 	if err := m.sendLocalState(conn, join); err != nil {
@@ -594,6 +610,7 @@ func (m *Memberlist) sendLocalState(conn net.Conn, join bool) error {
 	}
 
 	// Write out the entire send buffer
+	metrics.IncrCounter([]string{"memberlist", "tcp", "sent"}, float32(len(sendBuf)))
 	if _, err := conn.Write(sendBuf); err != nil {
 		return err
 	}
