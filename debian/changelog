@@ -1,0 +1,5 @@
+golang-memberlist (0.0~git20140127+16cd141-1) unstable; urgency=low
+
+  * Initial release (Closes: #nnnn)
+
+ -- Kouhei Maeda <mkouhei@palmtb.net>  Tue, 28 Jan 2014 19:34:25 +0900
