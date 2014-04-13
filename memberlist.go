@@ -66,11 +66,20 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	}
 
 	if len(conf.SecretKey) > 0 {
-		if len(conf.SecretKey) != 16 {
-			return nil, fmt.Errorf("SecretKey must be 16 bytes in length")
+		if conf.Keyring == nil {
+			keyring, err := NewKeyring(nil, conf.SecretKey)
+			if err != nil {
+				return nil, err
+			}
+			conf.Keyring = keyring
+		} else {
+			if err := conf.Keyring.AddKey(conf.SecretKey); err != nil {
+				return nil, err
+			}
+			if err := conf.Keyring.UseKey(conf.SecretKey); err != nil {
+				return nil, err
+			}
 		}
-	} else {
-		conf.SecretKey = nil
 	}
 
 	tcpAddr := &net.TCPAddr{IP: net.ParseIP(conf.BindAddr), Port: conf.BindPort}
@@ -251,7 +260,7 @@ func (m *Memberlist) setAlive() error {
 
 	// Check if this is a public address without encryption
 	addrStr := net.IP(advertiseAddr).String()
-	if !isPrivateIP(addrStr) && !isLoopbackIP(addrStr) && m.config.SecretKey == nil {
+	if !isPrivateIP(addrStr) && !isLoopbackIP(addrStr) && !m.config.EncryptionEnabled() {
 		m.logger.Printf("[WARN] memberlist: Binding to public address without encryption!")
 	}
 
@@ -276,7 +285,7 @@ func (m *Memberlist) setAlive() error {
 			m.config.DelegateProtocolVersion,
 		},
 	}
-	m.aliveNode(&a, nil)
+	m.aliveNode(&a, nil, true)
 
 	return nil
 }
@@ -323,7 +332,7 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 		},
 	}
 	notifyCh := make(chan struct{})
-	m.aliveNode(&a, notifyCh)
+	m.aliveNode(&a, notifyCh, true)
 
 	// Wait for the broadcast or a timeout
 	if m.anyAlive() {
@@ -338,6 +347,19 @@ func (m *Memberlist) UpdateNode(timeout time.Duration) error {
 		}
 	}
 	return nil
+}
+
+// SendTo is used to directly send a message to another node, without
+// the use of the gossip mechanism. This will encode the message as a
+// user-data message, which a delegate will receive through NotifyMsg
+func (m *Memberlist) SendTo(to net.Addr, msg []byte) error {
+	// Encode as a user message
+	buf := make([]byte, 1, len(msg)+1)
+	buf[0] = byte(userMsg)
+	buf = append(buf, msg...)
+
+	// Send the message
+	return m.rawSendMsg(to, buf)
 }
 
 // Members returns a list of all known live nodes. The node structures
