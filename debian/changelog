@@ -1,5 +1,5 @@
-golang-hashicorp-memberlist (0.0~git20140204+c303c7b-1) unstable; urgency=low
+golang-hashicorp-memberlist (0.0~git20140409+dfb09be-1) unstable; urgency=low
 
   * Initial release (Closes: #nnnn)
 
- -- Kouhei Maeda <mkouhei@palmtb.net>  Mon, 10 Feb 2014 10:50:20 +0900
+ -- Kouhei Maeda <mkouhei@palmtb.net>  Mon, 14 Apr 2014 05:46:54 +0900
