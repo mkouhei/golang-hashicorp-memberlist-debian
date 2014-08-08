@@ -261,7 +261,8 @@ func (m *Memberlist) probeNode(node *nodeState) {
 	}
 
 	// No acks received from target, suspect
-	s := suspect{Incarnation: node.Incarnation, Node: node.Name}
+	m.logger.Printf("[INFO] memberlist: Suspect %s has failed, no acks received", node.Name)
+	s := suspect{Incarnation: node.Incarnation, Node: node.Name, From: m.config.Name}
 	m.suspectNode(&s)
 }
 
@@ -299,6 +300,9 @@ func (m *Memberlist) gossip() {
 
 	// Compute the bytes available
 	bytesAvail := udpSendBuf - compoundHeaderOverhead
+	if m.config.EncryptionEnabled() {
+		bytesAvail -= encryptOverhead(m.encryptionVersion())
+	}
 
 	for _, node := range kNodes {
 		// Get any pending broadcasts
@@ -616,8 +620,14 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 		return
 	}
 
-	// Bail if the incarnation number is old
-	if a.Incarnation <= state.Incarnation {
+	// Bail if the incarnation number is older, and this is not about us
+	isLocalNode := state.Name == m.config.Name
+	if a.Incarnation <= state.Incarnation && !isLocalNode {
+		return
+	}
+
+	// Bail if strictly less and this is about us
+	if a.Incarnation < state.Incarnation && isLocalNode {
 		return
 	}
 
@@ -629,7 +639,30 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 	oldMeta := state.Meta
 
 	// If this is us we need to refute, otherwise re-broadcast
-	if !bootstrap && state.Name == m.config.Name {
+	if !bootstrap && isLocalNode {
+		// Compute the version vector
+		versions := []uint8{
+			state.PMin, state.PMax, state.PCur,
+			state.DMin, state.DMax, state.DCur,
+		}
+
+		// If the Incarnation is the same, we need special handling, since it
+		// possible for the following situation to happen:
+		// 1) Start with configuration C, join cluster
+		// 2) Hard fail / Kill / Shutdown
+		// 3) Restart with configuration C', join cluster
+		//
+		// In this case, other nodes and the local node see the same incarnation,
+		// but the values may not be the same. For this reason, we always
+		// need to do an equality check for this Incarnation. In most cases,
+		// we just ignore, but we may need to refute.
+		//
+		if a.Incarnation == state.Incarnation &&
+			bytes.Equal(a.Meta, state.Meta) &&
+			bytes.Equal(a.Vsn, versions) {
+			return
+		}
+
 		inc := m.nextIncarnation()
 		for a.Incarnation >= inc {
 			inc = m.nextIncarnation()
@@ -642,10 +675,7 @@ func (m *Memberlist) aliveNode(a *alive, notify chan struct{}, bootstrap bool) {
 			Addr:        state.Addr,
 			Port:        state.Port,
 			Meta:        state.Meta,
-			Vsn: []uint8{
-				state.PMin, state.PMax, state.PCur,
-				state.DMin, state.DMax, state.DCur,
-			},
+			Vsn:         versions,
 		}
 		m.encodeBroadcastNotify(a.Node, aliveMsg, a, notify)
 		m.logger.Printf("[WARN] memberlist: Refuting an alive message")
@@ -726,7 +756,7 @@ func (m *Memberlist) suspectNode(s *suspect) {
 			},
 		}
 		m.encodeAndBroadcast(s.Node, aliveMsg, a)
-		m.logger.Printf("[WARN] memberlist: Refuting a suspect message")
+		m.logger.Printf("[WARN] memberlist: Refuting a suspect message (from: %s)", s.From)
 		return // Do not mark ourself suspect
 	} else {
 		m.encodeAndBroadcast(s.Node, suspectMsg, s)
@@ -758,7 +788,8 @@ func (m *Memberlist) suspectNode(s *suspect) {
 // suspectTimeout is invoked when a suspect timeout has occurred
 func (m *Memberlist) suspectTimeout(n *nodeState) {
 	// Construct a dead message
-	d := dead{Incarnation: n.Incarnation, Node: n.Name}
+	m.logger.Printf("[INFO] memberlist: Marking %s as failed, suspect timeout reached", n.Name)
+	d := dead{Incarnation: n.Incarnation, Node: n.Name, From: m.config.Name}
 	m.deadNode(&d)
 }
 
@@ -806,7 +837,7 @@ func (m *Memberlist) deadNode(d *dead) {
 				},
 			}
 			m.encodeAndBroadcast(d.Node, aliveMsg, a)
-			m.logger.Printf("[WARN] memberlist: Refuting a dead message")
+			m.logger.Printf("[WARN] memberlist: Refuting a dead message (from: %s)", d.From)
 			return // Do not mark ourself dead
 		}
 
@@ -854,7 +885,7 @@ func (m *Memberlist) mergeState(remote []pushNodeState) {
 			// suspect that node instead of declaring it dead instantly
 			fallthrough
 		case stateSuspect:
-			s := suspect{Incarnation: r.Incarnation, Node: r.Name}
+			s := suspect{Incarnation: r.Incarnation, Node: r.Name, From: m.config.Name}
 			m.suspectNode(&s)
 		}
 	}

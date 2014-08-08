@@ -26,11 +26,13 @@ import (
 type Memberlist struct {
 	config         *Config
 	shutdown       bool
+	shutdownCh     chan struct{}
 	leave          bool
 	leaveBroadcast chan struct{}
 
 	udpListener *net.UDPConn
 	tcpListener *net.TCPListener
+	handoff     chan msgHandoff
 
 	sequenceNum uint32 // Local sequence number
 	incarnation uint32 // Local incarnation number
@@ -105,9 +107,11 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 
 	m := &Memberlist{
 		config:         conf,
+		shutdownCh:     make(chan struct{}),
 		leaveBroadcast: make(chan struct{}, 1),
 		udpListener:    udpLn,
 		tcpListener:    tcpLn,
+		handoff:        make(chan msgHandoff, 1024),
 		nodeMap:        make(map[string]*nodeState),
 		ackHandlers:    make(map[uint32]*ackHandler),
 		broadcasts:     &TransmitLimitedQueue{RetransmitMult: conf.RetransmitMult},
@@ -116,6 +120,7 @@ func newMemberlist(conf *Config) (*Memberlist, error) {
 	m.broadcasts.NumNodes = func() int { return len(m.nodes) }
 	go m.tcpListen()
 	go m.udpListen()
+	go m.udpHandler()
 	return m, nil
 }
 
@@ -230,18 +235,25 @@ func (m *Memberlist) setAlive() error {
 			}
 
 			// Find private IPv4 address
-			for _, addr := range addresses {
-				ip, ok := addr.(*net.IPNet)
-				if !ok {
+			for _, rawAddr := range addresses {
+				var ip net.IP
+				switch addr := rawAddr.(type) {
+				case *net.IPAddr:
+					ip = addr.IP
+				case *net.IPNet:
+					ip = addr.IP
+				default:
 					continue
 				}
-				if ip.IP.To4() == nil {
+
+				if ip.To4() == nil {
 					continue
 				}
-				if !isPrivateIP(ip.IP.String()) {
+				if !isPrivateIP(ip.String()) {
 					continue
 				}
-				advertiseAddr = ip.IP
+
+				advertiseAddr = ip
 				break
 			}
 
@@ -419,7 +431,7 @@ func (m *Memberlist) Leave(timeout time.Duration) error {
 
 		state, ok := m.nodeMap[m.config.Name]
 		if !ok {
-			m.logger.Println("[WARN] Leave but we're not in the node map.")
+			m.logger.Printf("[WARN] memberlist: Leave but we're not in the node map.")
 			return nil
 		}
 
@@ -478,12 +490,14 @@ func (m *Memberlist) Shutdown() error {
 	m.startStopLock.Lock()
 	defer m.startStopLock.Unlock()
 
-	if !m.shutdown {
-		m.shutdown = true
-		m.deschedule()
-		m.udpListener.Close()
-		m.tcpListener.Close()
+	if m.shutdown {
+		return nil
 	}
 
+	m.shutdown = true
+	close(m.shutdownCh)
+	m.deschedule()
+	m.udpListener.Close()
+	m.tcpListener.Close()
 	return nil
 }
